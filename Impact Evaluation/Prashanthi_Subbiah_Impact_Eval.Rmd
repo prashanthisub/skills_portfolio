@@ -1,0 +1,1780 @@
+---
+title: "Impact Evaluation Sample"
+author: "Prashanthi Subbiah"
+output: html_document
+---
+```{r setup, include=FALSE}
+# Set-up
+knitr::opts_chunk$set(echo = TRUE)
+options(scipen = 100, digits = 4)
+```
+
+# Coding
+## Packages
+
+```{r loading-packages, warning = FALSE, message = FALSE}
+# Clear working space
+rm(list=ls())
+
+# Loading/installing required packages
+pkgs <- c("tidyverse", 
+          "openxlsx",
+          "lubridate",
+          "visdat",
+          "ggplot2",
+          "foreign",
+          "haven",
+          "googlesheets4",
+          "outliers",
+          "scales", 
+          "grid",
+          "RColorBrewer",
+          "googledrive",
+          "ggthemes",
+          "kableExtra",
+          "knitr",
+          "wordcloud",
+          "tidytext",
+          "stringr", 
+          "boxr", 
+          "labelled",
+          "lubridate")
+
+# Loading all the packages
+invisible(lapply(pkgs,library,character.only=TRUE))
+
+rm(miss_pkgs)
+rm(pkgs)
+
+# Loading libraries for regressions 
+library(haven)
+library(tidyverse)
+library(glmnet)
+library(sandwich)
+library(plm)
+library(lmtest)
+library(stargazer)
+library(fixest)
+library(dplyr)
+```
+
+
+## Read Survey Data
+```{r upload-datasets}
+
+# Endline
+endline_raw <- read_dta("endline.dta")
+```
+
+```{r data-for-manipulation}
+### Create a dataset for checking data quality
+
+endline_df <- endline_raw
+```
+
+------------------------------------------------------------------------
+
+# ------- ENDLINE SURVEY -------
+
+# Quality Checks
+
+## 1. Logic checks
+
+### 1.1 Check that there are no duplicate observations
+
+```{r logic-checks-duplicates}
+# Should be 0 - anything above 0 indicates there is a surveyID missing
+sum(is.na(endline_df$id))
+
+# Should be 0 - anything above 0 means there is a duplicate surveyID
+sum(duplicated(endline_df$id))
+```
+
+### 1.2 Check that all surveys have consent
+
+```{r logic-checks-consent}
+# Table frequency of consent responses
+table(endline_df$agreed) # 792 consented, 11 have not
+
+# Drop individuals who did not give consent
+
+endline_df %>% filter(!agreed %in% c(1, 2)) # This line of code was added to 
+                                            # to understand why when we drop the
+                                            # those without consent we go from
+                                            # 877 to 792. Turns out that we have
+                                            # 11 people without consent and 85
+                                            # NA entries
+
+endline_df <- endline_df %>% filter(agreed %in% c(1,2)) 
+table(endline_df$agreed) # verify if the code worked
+```
+
+
+### 1.3 Check that no variable has all missing values
+
+```{r logic-checks-NAs, echo=FALSE, include=FALSE}
+# Variables with all observations missing 
+
+names(endline_df)[sapply(endline_df, function(x) !any(!is.na(x)))] # only the ones with TRUE
+```
+
+## 2. Enumerator checks
+
+### 2.1 Check average interview duration by enumerator
+
+```{r enumerator-check-average-duration, echo=FALSE}
+
+# Mean Survey Duration
+overall_avg_duration <- mean(endline_df$surveyduration[!is.na(endline_df$surveyduration)])
+
+
+temp <- endline_df %>%
+  group_by(deviceid) %>%
+  dplyr::summarize(mean_value = (mean(surveyduration, na.rm = TRUE))/60) %>%
+  mutate(difference= mean_value - (overall_avg_duration/60)) %>% 
+  dplyr::select(deviceid, mean_value, difference)
+```
+
+## 3. Dataset Revised
+
+```{r data-revised-new-df-after-quality-check}
+end_df <- endline_df
+```
+
+## 4. Analyzing the Well-Being Variables
+
+
+### 4.1 Creating a variable that returns aggregate of PHQ-4 variable
+
+```{r}
+## Making sure none of the variables have NA responses
+end_df_1 <- end_df %>% 
+  filter(!is.na(well1), 
+         !is.na(well2), 
+         !is.na(well3), 
+         !is.na(well4))
+
+
+## Recoding wellbeing to fit standard procedures
+end_df_1 <- end_df_1 %>%
+  mutate(well_1 = as.numeric(well1) - 1,
+         well_2 = as.numeric(well2) - 1,
+         well_3 = as.numeric(well3) - 1,
+         well_4 = as.numeric(well4) - 1) %>%
+  mutate(dep = well_1 + well_2,
+         anx = well_3 + well_4)
+
+unique(is.na(end_df_1$well4)) # Returns FALSE, so no NAs
+
+## Creating a Variable that returns the aggregate of the responses to the above questions
+end_df_1 <- end_df_1 %>%
+  mutate(phq_4 = well_1 + well_2 + well_3 + well_4)
+
+## Naming similarly to midline and endline surveys, and switching signs for methodological purposes
+end_df_1 <- end_df_1 %>%
+  mutate(tot_phq_4 = -phq_4,
+         dep_f = -dep,
+         anx_f = -anx)
+
+## Summarizing spread of wellbeing_agg
+well_sum <- summary(end_df_1$tot_phq_4)
+well_sum
+```
+
+
+### 4.2 Locus module
+```{r}
+# standardizing locus columns
+standardize_vars <- function(df, loc_num) {
+  loc_vars <- grep(paste0("loc_5_", loc_num), names(df), value = TRUE)
+  for (var in loc_vars) {
+    std_var_name <- paste0("std_", var)
+    df[[std_var_name]] <- scale(df[[var]], center = TRUE, scale = TRUE)
+  }
+  return(df)
+}
+
+# Apply the function for loc_5_1 to loc_5_9
+for (i in 1:9) {
+  end_df_1 <- standardize_vars(end_df_1, i)
+}
+
+## Starting by creating new dataframe with only variables related to Q1 of Locus of Control questions
+## Creating new column that replaces NAs with 0 for each column (loc_5_X_1_N)
+## Creating new column with score each participant put for loc_5_X_1 called loc_5_1_Sum
+
+end_df_2 <- end_df_1 %>%
+  select(std_loc_5_1_1, std_locloc_5_2_1, std_loc_5_3_1, std_loc_5_4_1, std_loc_5_5_1)%>%
+  mutate(loc_5_1_1_N = ifelse(is.na(std_loc_5_1_1), NA, std_loc_5_1_1), 
+         loc_5_2_1_N = ifelse(is.na(std_loc_5_2_1), NA, std_loc_5_2_1),
+         loc_5_3_1_N = ifelse(is.na(std_loc_5_3_1), NA, std_loc_5_3_1),
+         loc_5_4_1_N = ifelse(is.na(std_loc_5_4_1), NA, std_loc_5_4_1),
+         loc_5_5_1_N = ifelse(is.na(std_loc_5_5_1), NA, std_loc_5_5_1))
+
+end_df_2 <- end_df_2 %>%
+  select(loc_5_1_N, loc_5_2_1_N, loc_5_3_1_N, loc_5_4_1_N, loc_5_5_1_N)
+
+end_df_2$row_sum <- apply(end_df_2, 1, function(row) {
+  if (all(is.na(row))) {
+    return(NA)
+  } else {
+    return(sum(row, na.rm = TRUE))
+  }
+})
+
+sum(is.na(end_df_2$row_sum)) # no NAs
+
+end_df_2$loc_5_1_Sum <- rowSums(end_df_2[, c("loc_5_1_1_N", "loc_5_2_1_N", "loc_5_3_1_N", "loc_5_4_1_N", "loc_5_5_1_N")], na.rm = TRUE)
+
+end_df_2 <- end_df_2 %>%
+  select(loc_5_1_1_N, loc_5_2_1_N, loc_5_3_1_N, loc_5_4_1_N, loc_5_5_1_N, loc_5_1_Sum)
+
+## adding loc_5_1_Sum to end_df_1, with the rest of the variables
+end_df_1$loc_5_1_Stand = end_df_2$loc_5_1_Sum
+sum(is.na(end_df_1$loc_5_1_Stand)) # no NAs
+
+## Starting by creating new dataframe with only variables related to Q2 of Locus of Control questions
+## Creating new column that replaces NAs with 0 for each column (loc_5_X_2_N)
+## Creating new column with score each participant put for loc_5_X_2 called loc_5_2_Sum
+
+end_df_2 <- end_df_1 %>%
+  select(std_loc_5_1_2, std_loc_5_2_2, std_loc_5_3_2, std_loc_5_4_2, std_loc_5_5_2)%>%
+  mutate(loc_5_1_2_N = ifelse(is.na(std_loc_5_1_2), NA, std_loc_5_1_2), 
+         loc_5_2_2_N = ifelse(is.na(std_loc_5_2_2), NA, std_loc_5_2_2),
+         loc_5_3_2_N = ifelse(is.na(std_loc_5_3_2), NA, std_loc_5_3_2),
+         loc_5_4_2_N = ifelse(is.na(std_loc_5_4_2), NA, std_loc_5_4_2),
+         loc_5_5_2_N = ifelse(is.na(std_loc_5_5_2), NA, std_loc_5_5_2))
+
+end_df_2 <- end_df_2 %>%
+  select(loc_5_1_2_N, loc_5_2_2_N, loc_5_3_2_N, loc_5_4_2_N, loc_5_5_2_N)
+
+end_df_2$row_sum <- apply(end_df_2, 1, function(row) {
+  if (all(is.na(row))) {
+    return(NA)
+  } else {
+    return(sum(row, na.rm = TRUE))
+  }
+})
+
+sum(is.na(end_df_2$row_sum)) # no NAs
+
+end_df_2$loc_5_2_Sum <- rowSums(end_df_2[, c("loc_5_1_2_N", "loc_5_2_2_N", "loc_5_3_2_N", "loc_5_4_2_N", "loc_5_5_2_N")], na.rm = TRUE)
+
+end_df_2 <- end_df_2 %>%
+  select(loc_5_1_2_N, loc_5_2_2_N, loc_5_3_2_N, loc_5_4_2_N, loc_5_5_2_N, loc_5_2_Sum)
+
+## adding loc_5_2_Sum to end_df_1, with the rest of the variables
+end_df_1$loc_5_2_Stand = end_df_2$loc_5_2_Sum
+sum(is.na(end_df_1$loc_5_2_Stand)) # no NAs
+
+## Starting by creating new dataframe with only variables related to Q3 of Locus of Control questions
+## Creating new column that replaces NAs with 0 for each column (loc_5_X_3_N)
+## Creating new column with score each participant put for loc_5_X_3 called loc_5_3_Sum
+
+end_df_2 <- end_df_1 %>%
+  select(std_loc_5_1_3, std_loc_5_2_3, std_loc_5_3_3, std_loc_5_4_3, std_loc_5_5_3)%>%
+  mutate(loc_5_1_3_N = ifelse(is.na(std_loc_5_1_3), NA, std_loc_5_1_3), 
+         loc_5_2_3_N = ifelse(is.na(std_loc_5_2_3), NA, std_loc_5_2_3),
+         loc_5_3_3_N = ifelse(is.na(std_loc_5_3_3), NA, std_loc_5_3_3),
+         loc_5_4_3_N = ifelse(is.na(std_loc_5_4_3), NA, std_loc_5_4_3),
+         loc_5_5_3_N = ifelse(is.na(std_loc_5_5_3), NA, std_loc_5_5_3))
+
+end_df_2 <- end_df_2 %>%
+  select(loc_5_1_3_N, loc_5_2_3_N, loc_5_3_3_N, loc_5_4_3_N, loc_5_5_3_N)
+
+end_df_2$row_sum <- apply(end_df_2, 1, function(row) {
+  if (all(is.na(row))) {
+    return(NA)
+  } else {
+    return(sum(row, na.rm = TRUE))
+  }
+})
+
+sum(is.na(end_df_2$row_sum)) # no NAs
+
+end_df_2$loc_5_3_Sum <- rowSums(end_df_2[, c("loc_5_1_3_N", "loc_5_2_3_N", "loc_5_3_3_N", "loc_5_4_3_N", "loc_5_5_3_N")], na.rm = TRUE)
+
+end_df_2 <- end_df_2 %>%
+  select(loc_5_1_3_N, loc_5_2_3_N, loc_5_3_3_N, loc_5_4_3_N, loc_5_5_3_N, loc_5_3_Sum)
+
+end_df_2$row_sum <- apply(end_df_2, 1, function(row) {
+  if (all(is.na(row))) {
+    return(NA)
+  } else {
+    return(sum(row, na.rm = TRUE))
+  }
+})
+
+sum(is.na(end_df_2$row_sum)) # no NAs
+
+## adding loc_5_3_Sum to end_df_1, with the rest of the variables
+end_df_1$loc_5_3_Stand = end_df_2$loc_5_3_Sum
+sum(is.na(end_df_1$loc_5_3_Stand)) # no NAs
+
+## Starting by creating new dataframe with only variables related to Q4 of Locus of Control questions
+## Creating new column that replaces NAs with 0 for each column (loc_5_X_4_N)
+## Creating new column with score each participant put for loc_5_X_4 called loc_5_4_Sum
+
+end_df_2 <- end_df_1 %>%
+  select(std_loc_5_1_4, std_loc_5_2_4, std_loc_5_3_4, std_loc_5_4_4, std_loc_5_5_4, std_loc_5_6_4, std_loc_5_7_4, std_loc_5_8_4, std_loc_5_9_4)%>%
+  mutate(loc_5_1_4_N = ifelse(is.na(std_loc_5_1_4), NA, std_loc_5_1_4), 
+         loc_5_2_4_N = ifelse(is.na(std_loc_5_2_4), NA, std_loc_5_2_4),
+         loc_5_3_4_N = ifelse(is.na(std_loc_5_3_4), NA, std_loc_5_3_4),
+         loc_5_4_4_N = ifelse(is.na(std_loc_5_4_4), NA, std_loc_5_4_4),
+         loc_5_5_4_N = ifelse(is.na(std_loc_5_5_4), NA, std_loc_5_5_4))
+
+end_df_2 <- end_df_2 %>%
+  select(loc_5_1_4_N, loc_5_2_4_N, loc_5_3_4_N, loc_5_4_4_N, loc_5_5_4_N)
+
+end_df_2$row_sum <- apply(end_df_2, 1, function(row) {
+  if (all(is.na(row))) {
+    return(NA)
+  } else {
+    return(sum(row, na.rm = TRUE))
+  }
+})
+
+sum(is.na(end_df_2$row_sum)) 
+
+end_df_2$loc_5_4_Sum <- rowSums(end_df_2[, c("loc_5_1_4_N", "loc_5_2_4_N", "loc_5_3_4_N", "loc_5_4_4_N", "loc_5_5_4_N")], na.rm = TRUE)
+
+end_df_2 <- end_df_2 %>%
+  select(loc_5_1_4_N, loc_5_2_4_N, loc_5_3_4_N, loc_5_4_4_N, loc_5_5_4_N, loc_5_4_Sum)
+
+
+## adding loc_5_4_Sum to end_df_1, with the rest of the variables
+end_df_1$loc_5_4_Stand = end_df_2$loc_5_4_Sum
+sum(is.na(end_df_1$loc_5_4_Stand)) # no NAs
+
+## Starting by creating new dataframe with only variables related to Q5 of Locus of Control questions
+## Creating new column that replaces NAs with 0 for each column (loc_5_X_5_N)
+## Creating new column with score each participant put for loc_5_X_5 called loc_5_5_Sum
+
+end_df_2 <- end_df_1 %>%
+  select(std_loc_5_1_5, std_loc_5_2_5, std_loc_5_3_5, std_loc_5_4_5, std_loc_5_5_5, std_loc_5_6_5, std_loc_5_7_5, std_loc_5_8_5, std_loc_5_9_5)%>%
+  mutate(loc_5_1_5_N = ifelse(is.na(std_loc_5_1_5), NA, std_loc_5_1_5), 
+         loc_5_2_5_N = ifelse(is.na(std_loc_5_2_5), NA, std_loc_5_2_5),
+         loc_5_3_5_N = ifelse(is.na(std_loc_5_3_5), NA, std_loc_5_3_5),
+         loc_5_4_5_N = ifelse(is.na(std_loc_5_4_5), NA, std_loc_5_4_5),
+         loc_5_5_5_N = ifelse(is.na(std_loc_5_5_5), NA, std_loc_5_5_5))
+
+end_df_2 <- end_df_2 %>%
+  select(loc_5_1_5_N, loc_5_2_5_N, loc_5_3_5_N, loc_5_4_5_N, loc_5_5_5_N)
+
+end_df_2$row_sum <- apply(end_df_2, 1, function(row) {
+  if (all(is.na(row))) {
+    return(NA)
+  } else {
+    return(sum(row, na.rm = TRUE))
+  }
+})
+
+sum(is.na(end_df_2$row_sum)) 
+
+end_df_2$loc_5_5_Sum <- rowSums(end_df_2[, c("loc_5_1_5_N", "loc_5_2_5_N", "loc_5_3_5_N", "loc_5_4_5_N", "loc_5_5_5_N")], na.rm = TRUE)
+
+end_df_2 <- end_df_2 %>%
+  select(loc_5_1_5_N, loc_5_2_5_N, loc_5_3_5_N, loc_5_4_5_N, loc_5_5_5_N, loc_5_5_Sum)
+
+## adding loc_5_5_Sum to end_df_1, with the rest of the variables
+end_df_1$loc_5_5_Stand = end_df_2$loc_5_5_Sum
+sum(is.na(end_df_1$loc_5_5_Stand)) # no NAs
+
+## Starting by creating new dataframe with only variables related to Q6 of Locus of Control questions
+## Creating new column that replaces NAs with 0 for each column (loc_5_X_6_N)
+## Creating new column with score each participant put for loc_5_X_6 called loc_5_6_Sum
+
+end_df_2 <- end_df_1 %>%
+  select(std_loc_5_1_6, std_loc_5_2_6, std_loc_5_3_6, std_loc_5_4_6, std_loc_5_5_6)%>%
+  mutate(loc_5_1_6_N = ifelse(is.na(std_loc_5_1_6), NA, std_loc_5_1_6), 
+         loc_5_2_6_N = ifelse(is.na(std_loc_5_2_6), NA, std_loc_5_2_6),
+         loc_5_3_6_N = ifelse(is.na(std_loc_5_3_6), NA, std_loc_5_3_6),
+         loc_5_4_6_N = ifelse(is.na(std_loc_5_4_6), NA, std_loc_5_4_6),
+         loc_5_5_6_N = ifelse(is.na(std_loc_5_5_6), NA, std_loc_5_5_6))
+
+end_df_2 <- end_df_2 %>%
+  select(loc_5_1_6_N, loc_5_2_6_N, loc_5_3_6_N, loc_5_4_6_N, loc_5_5_6_N)
+
+end_df_2$row_sum <- apply(end_df_2, 1, function(row) {
+  if (all(is.na(row))) {
+    return(NA)
+  } else {
+    return(sum(row, na.rm = TRUE))
+  }
+})
+
+sum(is.na(end_df_2$row_sum)) 
+
+end_df_2$loc_5_6_Sum <- rowSums(end_df_2[, c("loc_5_1_6_N", "loc_5_2_6_N", "loc_5_3_6_N", "loc_5_4_6_N", "loc_5_5_6_N")], na.rm = TRUE)
+
+end_df_2 <- end_df_2 %>%
+  select(loc_5_1_6_N, loc_5_2_6_N, loc_5_3_6_N, loc_5_4_6_N, loc_5_5_6_N, loc_5_6_Sum)
+
+## adding loc_5_6_Sum to end_df_1, with the rest of the variables
+end_df_1$loc_5_6_Stand = end_df_2$loc_5_6_Sum
+sum(is.na(end_df_1$loc_5_6_Stand)) # no NAs
+
+## Starting by creating new dataframe with only variables related to Q7 of Locus of Control questions
+## Creating new column that replaces NAs with 0 for each column (loc_5_X_7_N)
+## Creating new column with score each participant put for loc_5_X_7 called loc_5_7_Sum
+
+end_df_2 <- end_df_1 %>%
+  select(std_loc_5_1_7, std_loc_5_2_7, std_loc_5_3_7, std_loc_5_4_7, std_loc_5_5_7)%>%
+  mutate(loc_5_1_7_N = ifelse(is.na(std_loc_5_1_7), NA, std_loc_5_1_7), 
+         loc_5_2_7_N = ifelse(is.na(std_loc_5_2_7), NA, std_loc_5_2_7),
+         loc_5_3_7_N = ifelse(is.na(std_loc_5_3_7), NA, std_loc_5_3_7),
+         loc_5_4_7_N = ifelse(is.na(std_loc_5_4_7), NA, std_loc_5_4_7),
+         loc_5_5_7_N = ifelse(is.na(std_loc_5_5_7), NA, std_loc_5_5_7))
+
+end_df_2 <- end_df_2 %>%
+  select(loc_5_1_7_N, loc_5_2_7_N, loc_5_3_7_N, loc_5_4_7_N, loc_5_5_7_N)
+
+end_df_2$row_sum <- apply(end_df_2, 1, function(row) {
+  if (all(is.na(row))) {
+    return(NA)
+  } else {
+    return(sum(row, na.rm = TRUE))
+  }
+})
+
+sum(is.na(end_df_2$row_sum)) 
+
+end_df_2$loc_5_7_Sum <- rowSums(end_df_2[, c("loc_5_1_7_N", "loc_5_2_7_N", "loc_5_3_7_N", "loc_5_4_7_N", "loc_5_5_7_N")], na.rm = TRUE)
+
+end_df_2 <- end_df_2 %>%
+  select(loc_5_1_7_N, loc_5_2_7_N, loc_5_3_7_N, loc_5_4_7_N, loc_5_5_7_N, loc_5_7_Sum)
+
+## adding loc_5_7_Sum to end_df_1, with the rest of the variables
+end_df_1$loc_5_7_Stand = end_df_2$loc_5_7_Sum
+sum(is.na(end_df_1$loc_5_7_Stand)) # no NAs
+
+## Starting by creating new dataframe with only variables related to Q8 of Locus of Control questions
+## Creating new column that replaces NAs with 0 for each column (loc_5_X_8_N)
+## Creating new column with score each participant put for loc_5_X_8 called loc_5_8_Sum
+
+end_df_2 <- end_df_1 %>%
+  select(std_loc_5_1_8, std_loc_5_2_8, std_loc_5_3_8, std_loc_5_4_8, std_loc_5_5_8)%>%
+  mutate(loc_5_1_8_N = ifelse(is.na(std_loc_5_1_8), NA, std_loc_5_1_8), 
+         loc_5_2_8_N = ifelse(is.na(std_loc_5_2_8), NA, std_loc_5_2_8),
+         loc_5_3_8_N = ifelse(is.na(std_loc_5_3_8), NA, std_loc_5_3_8),
+         loc_5_4_8_N = ifelse(is.na(std_loc_5_4_8), NA, std_loc_5_4_8),
+         loc_5_5_8_N = ifelse(is.na(std_loc_5_5_8), NA, std_loc_5_5_8))
+
+end_df_2 <- end_df_2 %>%
+  select(loc_5_1_8_N, loc_5_2_8_N, loc_5_3_8_N, loc_5_4_8_N, loc_5_5_8_N)
+
+end_df_2$row_sum <- apply(end_df_2, 1, function(row) {
+  if (all(is.na(row))) {
+    return(NA)
+  } else {
+    return(sum(row, na.rm = TRUE))
+  }
+})
+
+sum(is.na(end_df_2$row_sum)) 
+
+end_df_2$loc_5_8_Sum <- rowSums(end_df_2[, c("loc_5_1_8_N", "loc_5_2_8_N", "loc_5_3_8_N", "loc_5_4_8_N", "loc_5_5_8_N")], na.rm = TRUE)
+
+end_df_2 <- end_df_2 %>%
+  select(loc_5_1_8_N, loc_5_2_8_N, loc_5_3_8_N, loc_5_4_8_N, loc_5_5_8_N, loc_5_8_Sum)
+
+## adding loc_5_8_Sum to end_df_1, with the rest of the variables
+end_df_1$loc_5_8_Stand = end_df_2$loc_5_8_Sum
+sum(is.na(end_df_1$loc_5_8_Stand)) # no NAs
+
+## Starting by creating new dataframe with only variables related to Q9 of Locus of Control questions
+## Creating new column that replaces NAs with 0 for each column (loc_5_X_9_N)
+## Creating new column with score each participant put for loc_5_X_9 called loc_5_9_Sum
+
+end_df_2 <- end_df_1 %>%
+  select(std_loc_5_1_9, std_loc_5_2_9, std_loc_5_3_9, std_loc_5_4_9, std_loc_5_5_9)%>%
+  mutate(loc_5_1_9_N = ifelse(is.na(std_loc_5_1_9), NA, std_loc_5_1_9), 
+         loc_5_2_9_N = ifelse(is.na(std_loc_5_2_9), NA, std_loc_5_2_9),
+         loc_5_3_9_N = ifelse(is.na(std_loc_5_3_9), NA, std_loc_5_3_9),
+         loc_5_4_9_N = ifelse(is.na(std_loc_5_4_9), NA, std_loc_5_4_9),
+         loc_5_5_9_N = ifelse(is.na(std_loc_5_5_9), NA, std_loc_5_5_9))
+
+end_df_2 <- end_df_2 %>%
+  select(loc_5_1_9_N, loc_5_2_9_N, loc_5_3_9_N, loc_5_4_9_N, loc_5_5_9_N)
+
+end_df_2$row_sum <- apply(end_df_2, 1, function(row) {
+  if (all(is.na(row))) {
+    return(NA)
+  } else {
+    return(sum(row, na.rm = TRUE))
+  }
+})
+
+sum(is.na(end_df_2$row_sum)) 
+
+end_df_2$loc_5_9_Sum <- rowSums(end_df_2[, c("loc_5_1_9_N", "loc_5_2_9_N", "loc_5_3_9_N", "loc_5_4_9_N", "loc_5_5_9_N")], na.rm = TRUE)
+
+end_df_2 <- end_df_2 %>%
+  select(loc_5_1_9_N, loc_5_2_9_N, loc_5_3_9_N, loc_5_4_9_N, loc_5_5_9_N, loc_5_9_Sum)
+
+## adding loc_5_9_Sum to end_df_1, with the rest of the variables
+end_df_1$loc_5_9_Stand = end_df_2$loc_5_9_Sum
+sum(is.na(end_df_1$loc_5_9_Stand)) # no NAs
+
+# Overwrite 'value' with its negative values
+end_df_1$loc_5_3_Stand <- - end_df_1$loc_5_3_Stand
+end_df_1$loc_5_5_Stand <- - end_df_1$loc_5_5_Stand
+end_df_1$loc_5_6_Stand <- - end_df_1$loc_5_6_Stand
+end_df_1$loc_5_8_Stand <- - end_df_1$loc_5_8_Stand
+end_df_1$loc_5_9_Stand <- - end_df_1$loc_5_9_Stand
+
+# Load necessary libraries
+library(psych)  # For factor analysis
+
+# External control variables
+ext_vars <- c("loc_5_3_Stand", "loc_5_5_Stand", "loc_5_6_Stand", "loc_5_8_Stand", "loc_5_9_Stand")
+
+# PCA for external control 
+pca_e <- prcomp(end_df_1[external_vars], center = TRUE, scale. = TRUE)
+pca_e
+end_df_1$loc_pca_e <- predict(pca_e)[, 1]  # First principal component
+
+# Factor analysis for external control
+fa_e <- factanal(end_df_1[ext_vars], factors = 1, scores = "regression")
+end_df_1$loc_factor_5_ext <- fa_e$scores[, 1]
+
+# Internal control variables
+int_vars <- c("loc_5_1_Stand", "loc_5_2_Stand", "loc_5_4_Stand", "loc_5_7_Stand")
+
+# PCA for internal control
+pca_i <- prcomp(end_df_1[int_vars], center = TRUE, scale. = TRUE)
+end_df_1$loc_pca_i <- predict(pca_i)[, 1]  # First principal component
+
+# Factor analysis for internal control
+fa_i <- factanal(end_df_1[int_vars], factors = 1, scores = "regression")
+end_df_1$loc_factor_5_int <- fa_i$scores[, 1]
+
+# Combined variables
+tot_vars <- c("loc_5_1_Stand", "loc_5_2_Stand", "loc_5_3_Stand","loc_5_4_Stand", "loc_5_5_Stand", "loc_5_6_Stand", "loc_5_7_Stand", "loc_5_8_Stand", "loc_5_9_Stand")
+
+# PCA for combined variables
+pca_tot <- prcomp(end_df_1[tot_vars], center = TRUE, scale. = TRUE)
+end_df_1$loc_pca_t <- predict(pca_tot)[, 1]  # First principal component
+
+# Factor analysis for combined variables
+fa_comb <- factanal(end_df_1[tot_vars], factors = 1, scores = "regression")
+end_df_1$loc_factor_t <- fa_comb$scores[, 1]
+
+# Assuming you have already created 'loc_pca_5' and 'loc_pca_pos'
+
+# Create 'pca_locus' and replace NA values
+end_df_1$pca_loc <- end_df_1$loc_pca_t
+end_df_1$fac_locus <- end_df_1$loc_factor_t
+range(end_df_1$pca_loc)
+
+# Assuming you have already created 'loc_pca_5int'
+
+# Create 'pca_internal' and assign it the values of 'loc_pca_5int'
+end_df_1$pca_int <- end_df_1$loc_factor_5_int
+end_df_1$pca_ext <- end_df_1$loc_factor_5_ext
+
+# Checking for NAs
+sum(is.na(end_df_1$pca_loc))
+sum(is.na(end_df_1$pca_int))
+sum(is.na(end_df_1$pca_ext)) #no NAs
+```
+
+# Creating other variables
+```{r}
+# Creating ladder_diff
+end_df_1 <- end_df_1 %>%
+  mutate(ladder_change = ladder_later - ladder_present)
+
+# Creating control to indicate treatment status
+end_df_1 <- end_df_1 %>%
+  mutate(control = case_when(treat == 0 ~ 1,
+                             treat == 1 ~ 0,
+                             treat == 2 ~ 0))
+
+end_df_3 <- end_df_1 %>%
+  select(id, tot_phq_4, dep_f, anx_f, pca_loc, pca_int, pca_ext, ladder_present, ladder_later, ladder_change, control)
+
+# Compute the composite index
+end_df_3 <- end_df_3 %>%
+  mutate(w_index = tot_phq_4 + dep_f + anx_f + pca_locus + pca_internal + pca_external + ladder_now + ladder_five + ladder_diff)
+
+# Calculate the mean and standard deviation
+control_value_df <- end_df_3 %>%
+  filter(control == 1)
+
+mean_control_value <- mean(control_value_df$w_index)
+
+sd_control_value <- sd(control_value_df$w_index)
+
+# Standardize the variable
+end_df_3$w_index <- (end_df_3$w_index - mean_control_value) / sd_control_value
+
+# Summary
+summary(end_df_3$w_index)
+
+# Checking for NAs
+sum(is.na(end_df_3$w_index))
+```
+
+# Exporting to CSV
+```{r}
+# Selecting needed columns
+end_df_updated <- end_df_3 %>%
+  select(id, tot_phq_4, dep_f, anx_f, pca_locus, pca_internal, pca_external, ladder_now, ladder_five, ladder_diff, control, w_index)
+
+# Renaming to make merger easier
+colnames(end_df_updated)
+colnames(end_df_updated) <- c("id", "el_tot_phq_4", "el_dep_f", "el_anx_f", "el_pca_locus",  "el_pca_internal", "el_pca_external", "el_ladder_now", "el_ladder_five", "el_ladder_diff", "el_control", "el_w_index")
+colnames(end_df_updated)
+
+# Export to CSV
+write.csv(end_df_updated, "C:/Users/prash/OneDrive/Documents/ID Policy Lab/grow_wellbeing_endline_clean.csv", row.names = FALSE)
+
+# Checking for NAs
+sum(is.na(end_df_updated)) # no NAs
+```
+
+# Loading all 3 CSVs
+```{r}
+# Importing all surveys
+
+# Baseline
+base_df <- read.csv("baseline_clean.csv")
+
+# Midline
+mid_df <- read.csv("midline_clean.csv")
+
+# Endline
+end_df <- read.csv("endline_clean.csv")
+
+# Merging all wellbeing
+updated_final <- left_join(base_df, mid_df, by = "id") 
+updated_final <- left_join(updated_final_wellbeing, end_df, by = "id") 
+
+```
+
+------------------------------------------------------------------------
+
+# ------- FINAL REGRESSIONS -------
+
+```{r upload-datasets}
+# Loading Data
+final_df <- read_csv("final_clean_dataset.csv")
+
+# Final Encodings of Sex and Marital Status
+final_df$bl_sex_label_1 <-  ifelse(final_df$bl_sex_label_1 == "Female", 1, 0)
+final_df$bl_marital_status <- ifelse(final_df$bl_marital_status == "Single", 0,1)
+```
+
+
+# Lee Bounds - Wellbeing Index
+## Pooled Treatment
+### Estimate response rates by the attrition
+```{r Endline-Pooled-step1}
+# Checking midline labor supply response rate
+ml_response_rates <- final_df %>%
+  group_by(Treat_C) %>%
+  summarise(
+    response_rate = mean(!is.na(ml_w_index)), 
+    n_responses = sum(!is.na(ml_w_index)),   
+    n_total = n()                                  
+  )
+
+el_response_rates <- final_df %>%
+  group_by(Treat_C) %>%
+  summarise(
+    response_rate = mean(!is.na(el_w_index)), 
+    n_responses = sum(!is.na(el_w_index)),   
+    n_total = n()                                  
+  )
+
+print(ml_response_rates)
+print(el_response_rates)
+```
+
+```{r Endline-Pooled-step2}
+# STEP 2: Calculate the DIFFERENTIAL ATTRITION between groups
+
+# midline
+ml_response_rate_control <- 0.88
+ml_response_rate_treatment <- 0.92
+ml_differential_rate <- (ml_response_rate_treatment - ml_response_rate_control)*100
+
+# endline
+# Response rates BY group
+el_response_rate_control <- 0.77
+el_response_rate_treatment <- 0.84
+el_differential_rate <- (el_response_rate_treatment - el_response_rate_control)*100
+
+print(ml_differential_rate)
+print(el_differential_rate)
+```
+
+
+### Trimming
+```{r Endline-Pooled-step3}
+# STEP 3: Calculate the PROPORTION to TRIM from the group with less attrition
+ml_trim_proportion <- ml_differential_rate / (0.92*100)
+el_trim_proportion <- el_differential_rate / (0.84*100)
+
+print(ml_trim_proportion)
+print(el_trim_proportion)
+```
+
+```{r Endline-Pooled-step3.1}
+# STEP 3.1: Lets see how many observations we should trim to get the proportion correct
+ml_trim_count_treatment <- ml_response_rates %>%
+  filter(Treat_C == 1) %>%
+  mutate(trim_count = ceiling(ml_trim_proportion * n_responses)) %>%
+  pull(trim_count)
+ml_trim_count_treatment # we should trim 23 for the midline
+
+el_trim_count_treatment <- el_response_rates %>%
+  filter(Treat_C == 1) %>%
+  mutate(trim_count = ceiling(el_trim_proportion * n_responses)) %>%
+  pull(trim_count)
+el_trim_count_treatment # we should trim 40 for the endline
+```
+
+
+```{r}
+# STEP 4: Trimming time! 
+
+trimmed_lower <- final_df
+trimmed_upper <- final_df
+
+# Trimming: Helper function to get global indices to make sure only treatment observations are cut
+get_global_indices <- function(data, condition, column, trim_count, decreasing = FALSE) {
+  # Subset global indices for rows satisfying the condition
+  subset_indices <- which(condition)
+  # Order the specified column within the subset
+  ordered_indices <- order(data[[column]][condition], decreasing = decreasing, na.last = NA)
+  # Select the top `trim_count` indices and map them back to global indices
+  subset_indices[ordered_indices[1:trim_count]]
+}
+
+# 1. For the upper bound, set the smallest values in the treatment group (Treat_C == 1) to NA
+ml_lowest_indices <- get_global_indices(
+  data = final_df,
+  condition = final_df$Treat_C == 1,
+  column = "ml_w_index",
+  trim_count = ml_trim_count_treatment
+)
+trimmed_upper$ml_w_index[ml_lowest_indices] <- NA
+
+el_lowest_indices <- get_global_indices(
+  data = final_df,
+  condition = final_df$Treat_C == 1,
+  column = "el_w_index",
+  trim_count = el_trim_count_treatment
+)
+trimmed_upper$el_w_index[el_lowest_indices] <- NA
+
+# 2. For the lower bound, set the largest values in the treatment group (Treat_C == 1) to NA
+ml_highest_indices <- get_global_indices(
+  data = final_df,
+  condition = final_df$Treat_C == 1,
+  column = "ml_w_index",
+  trim_count = ml_trim_count_treatment,
+  decreasing = TRUE
+)
+trimmed_lower$ml_w_index[ml_highest_indices] <- NA
+
+el_highest_indices <- get_global_indices(
+  data = final_df,
+  condition = final_df$Treat_C == 1,
+  column = "el_w_index",
+  trim_count = el_trim_count_treatment,
+  decreasing = TRUE
+)
+trimmed_lower$el_w_index[el_highest_indices] <- NA
+
+# Verifying that observations cut are only from treatment
+trimmed_lower$rct[el_highest_indices] 
+trimmed_lower$rct[ml_highest_indices] 
+trimmed_lower$rct[ml_lowest_indices] 
+trimmed_lower$rct[el_lowest_indices] 
+
+trimmed_upper$rct[el_highest_indices] 
+trimmed_upper$rct[ml_highest_indices] 
+trimmed_upper$rct[ml_lowest_indices] 
+trimmed_upper$rct[el_lowest_indices] 
+
+
+# Check trimmed dataframes
+sum(is.na(trimmed_lower$ml_w_index)) 
+sum(is.na(trimmed_upper$ml_w_index)) 
+sum(is.na(trimmed_lower$el_w_index))  
+sum(is.na(trimmed_upper$el_w_index)) 
+```
+
+
+# Separated
+### Estimate response rates by the attrition
+```{r Endline-Separated-step1}
+# Checking midline labor supply response rate
+ml_response_rates <- final_df %>%
+  group_by(rct) %>%
+  summarise(
+    response_rate = mean(!is.na(ml_w_index)), 
+    n_responses = sum(!is.na(ml_w_index)),   
+    n_total = n()                                  
+  )
+
+el_response_rates <- final_df %>%
+  group_by(rct) %>%
+  summarise(
+    response_rate = mean(!is.na(el_w_index)), 
+    n_responses = sum(!is.na(el_w_index)),   
+    n_total = n()                                  
+  )
+
+print(ml_response_rates)
+print(el_response_rates)
+```
+
+
+```{r}
+# STEP 2: Calculate the DIFFERENTIAL ATTRITION between groups
+# midline
+ml_response_rate_control <- 0.88
+ml_response_rate_treatment1 <- 0.91
+ml_response_rate_treatment2 <- 0.94
+
+# endline
+# Response rates BY group
+el_response_rate_control <- 0.77
+el_response_rate_treatment1 <- 0.82
+el_response_rate_treatment2 <- 0.86
+
+# Differential attrition rates
+ml_differential_rate_treatment1 <- (ml_response_rate_treatment1 - ml_response_rate_control)*100
+ml_differential_rate_treatment2 <- (ml_response_rate_treatment2 - ml_response_rate_control)*100
+
+el_differential_rate_treatment1 <- (el_response_rate_treatment1 - el_response_rate_control)*100
+el_differential_rate_treatment2 <- (el_response_rate_treatment2 - el_response_rate_control)*100
+
+print(ml_differential_rate_treatment1)
+print(ml_differential_rate_treatment2)
+print(el_differential_rate_treatment1)
+print(el_differential_rate_treatment2)
+```
+
+
+```{r}
+# STEP 3: Calculate the PROPORTION to TRIM from the group with less attrition
+# midline
+# Proportions to trim
+ml_trim_proportion_treatment1 <- ml_differential_rate_treatment1 / (0.91*100) # Less attrition in T1 compared to control 
+ml_trim_proportion_treatment1 # we need to trim 0.97% of the treatment group 1
+ml_trim_proportion_treatment2 <- ml_differential_rate_treatment1 / (0.94*100) # Less attrition in T2 compared to control 
+ml_trim_proportion_treatment2 # we need to trim 0.96% of the treatment group 2
+
+# endline
+# Proportions to trim
+el_trim_proportion_treatment1 <- el_differential_rate_treatment1 / (0.82 *100) # Less attrition in T1 compared to control 
+el_trim_proportion_treatment1 # we need to trim 2.2% of the treatment group 1
+el_trim_proportion_treatment2 <- el_differential_rate_treatment1 / (0.86 *100) # Less attrition in T2 compared to control 
+el_trim_proportion_treatment2 # we need to trim 2.135% of the treatment group 2
+```
+
+
+
+```{r}
+# STEP 3.1: Calculate the number of observations to trim
+
+ml_trim_count_treatment1 <- ml_response_rates %>%
+  filter(rct == 1) %>%
+  mutate(trim_count = ceiling(ml_trim_proportion_treatment1 * n_responses)) %>%
+  pull(trim_count)
+ml_trim_count_treatment1
+
+
+ml_trim_count_treatment2 <- ml_response_rates %>%
+  filter(rct == 2) %>%
+  mutate(trim_count = ceiling(ml_trim_proportion_treatment2 * n_responses)) %>%
+  pull(trim_count)
+ml_trim_count_treatment2
+
+# endline
+el_trim_count_treatment1 <- el_response_rates %>%
+  filter(rct == 1) %>%
+  mutate(trim_count = ceiling(el_trim_proportion_treatment1 * n_responses)) %>%
+  pull(trim_count)
+el_trim_count_treatment1
+
+el_trim_count_treatment2 <- el_response_rates %>%
+  filter(rct == 2) %>%
+  mutate(trim_count = ceiling(el_trim_proportion_treatment2 * n_responses)) %>%
+  pull(trim_count)
+el_trim_count_treatment2
+```
+
+
+```{r}
+# STEP 4: Trimming time! 
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Create trimmed copies of the dataframe
+trimmed_df_lower_sep <- final_df
+trimmed_df_upper_sep <- final_df
+
+# Helper function to get global indices
+get_global_indices <- function(data, condition, column, trim_count, decreasing = FALSE) {
+  # Subset global indices for rows satisfying the condition
+  subset_indices <- which(condition)
+  # Order the specified column within the subset
+  ordered_indices <- order(data[[column]][condition], decreasing = decreasing, na.last = NA)
+  # Select the top `trim_count` indices and map them back to global indices
+  subset_indices[ordered_indices[1:min(trim_count, length(ordered_indices))]]
+}
+
+# 1. Treatment 1 
+# Upper Bound (smallest values)
+ml_lowest_indices_t1 <- get_global_indices(
+  data = final_df,
+  condition = final_df$rct == 1,
+  column = "ml_w_index",
+  trim_count = ml_trim_count_treatment1
+)
+trimmed_df_upper_sep$ml_w_index[ml_lowest_indices_t1] <- NA
+
+el_lowest_indices_t1 <- get_global_indices(
+  data = final_df,
+  condition = final_df$rct == 1,
+  column = "el_w_index",
+  trim_count = el_trim_count_treatment1
+)
+trimmed_df_upper_sep$el_w_index[el_lowest_indices_t1] <- NA
+
+# Lower Bound (largest values)
+ml_highest_indices_t1 <- get_global_indices(
+  data = final_df,
+  condition = final_df$rct == 1,
+  column = "ml_w_index",
+  trim_count = ml_trim_count_treatment1,
+  decreasing = TRUE
+)
+trimmed_df_lower_sep$ml_w_index[ml_highest_indices_t1] <- NA
+
+el_highest_indices_t1 <- get_global_indices(
+  data = final_df,
+  condition = final_df$rct == 1,
+  column = "el_w_index",
+  trim_count = el_trim_count_treatment1,
+  decreasing = TRUE
+)
+trimmed_df_lower_sep$el_w_index[el_highest_indices_t1] <- NA
+
+# 2. Treatment 2 
+# Upper Bound (smallest values)
+ml_lowest_indices_t2 <- get_global_indices(
+  data = final_df,
+  condition = final_df$rct == 2,
+  column = "ml_w_index",
+  trim_count = ml_trim_count_treatment2
+)
+trimmed_df_upper_sep$ml_w_index[ml_lowest_indices_t2] <- NA
+
+el_lowest_indices_t2 <- get_global_indices(
+  data = final_df,
+  condition = final_df$rct == 2,
+  column = "el_w_index",
+  trim_count = el_trim_count_treatment2
+)
+trimmed_df_upper_sep$el_w_index[el_lowest_indices_t2] <- NA
+
+# Lower Bound (largest values)
+ml_highest_indices_t2 <- get_global_indices(
+  data = final_df,
+  condition = final_df$rct == 2,
+  column = "ml_w_index",
+  trim_count = ml_trim_count_treatment2,
+  decreasing = TRUE
+)
+trimmed_df_lower_sep$ml_w_index[ml_highest_indices_t2] <- NA
+
+el_highest_indices_t2 <- get_global_indices(
+  data = final_df,
+  condition = final_df$rct == 2,
+  column = "el_w_index",
+  trim_count = el_trim_count_treatment2,
+  decreasing = TRUE
+)
+trimmed_df_lower_sep$el_w_index[el_highest_indices_t2] <- NA
+
+# Check the number of NAs added from trimming
+sum(is.na(trimmed_df_lower_sep$ml_w_index)) 
+sum(is.na(trimmed_df_upper_sep$ml_w_index)) 
+sum(is.na(trimmed_df_lower_sep$el_w_index)) 
+sum(is.na(trimmed_df_upper_sep$el_w_index)) 
+
+# Verifying that observations cut are only from Treatment 1 or 2 for highest indicies
+trimmed_df_lower_sep$rct[el_highest_indices_t1] 
+trimmed_df_lower_sep$rct[ml_highest_indices_t1] 
+trimmed_df_lower_sep$rct[el_highest_indices_t2] 
+trimmed_df_lower_sep$rct[ml_highest_indices_t2]
+
+# Verifying that observations cut are only from Treatment 1 or 2 for lowest indicies
+trimmed_df_upper_sep$rct[el_highest_indices_t1] 
+trimmed_df_upper_sep$rct[ml_highest_indices_t1] 
+trimmed_df_upper_sep$rct[el_highest_indices_t2] 
+trimmed_df_upper_sep$rct[ml_highest_indices_t2] 
+```
+
+
+# Regressions: Pooled Specification
+### Midline Replication with Fixed Effects
+```{r}
+
+# Define controls
+controls <- c("bl_w_age", "bl_no_education", "bl_marital_status", 
+              "bl_primary_completed", "bl_secondary_completed", 
+              "bl_hh_size", "bl_n_children", "bl_sex_label_1", "bl_child_age_months_")
+
+# Define formula
+formula_2_p <- as.formula(
+  paste("ml_w_index ~ Treat_C + bl_w_index + ", 
+        paste(controls, collapse = " + "), "| bl_w_loc")
+)
+
+# Fit model
+model_2_p <- feols(formula_2_p, data = final_df)
+
+# Compute clustered standard errors
+summary(model_2_p, cluster ~ id)
+
+# Obtaining control mean
+control_df <- final_df %>%
+  filter(rct == 0)
+
+mean(control_df$ml_w_index, na.rm = TRUE)
+```
+
+
+## LASSO Attempt and Midline Regressions
+### With FE
+```{r}
+# Preprocess data: Keep only complete cases
+complete_cases <- complete.cases(final_df$ml_w_index, final_df$Treat_C, 
+                                 final_df$bl_w_index, final_df$bl_w_loc, final_df$bl_w_age, final_df$bl_no_education, final_df$bl_marital_status, final_df$bl_primary_completed, final_df$bl_secondary_completed, final_df$bl_hh_size, final_df$bl_n_children, final_df$bl_sex_label_1, 
+                                 final_df$bl_child_age_months_)
+
+y <- final_df$ml_w_index[complete_cases]  # Outcome (midline labor supply)
+d <- final_df$Treat_C[complete_cases]  # Treatment (Treat_C dummy)
+X <- scale(model.matrix(~ bl_w_index + bl_marital_status + bl_w_age + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_n_children + bl_sex_label_1 + bl_child_age_months_ + bl_w_loc - 1, data = final_df[complete_cases, ]))  # Covariates
+
+# LASSO for outcome (y) and treatment (d)
+lasso_y <- cv.glmnet(X, y, alpha = 1)  # LASSO for outcome
+lasso_d <- cv.glmnet(X, d, alpha = 1, family = "binomial")  # LASSO for treatment
+
+# Combine selected variables
+selected_vars <- union(
+  which(coef(lasso_y, s = "lambda.min")[-1] != 0),
+  which(coef(lasso_d, s = "lambda.min")[-1] != 0)
+)
+
+# Final OLS regression
+X_selected <- if (length(selected_vars) > 0) X[, selected_vars, drop = FALSE] else matrix(nrow = nrow(X), ncol = 0)
+model_pds <- lm(y ~ d + X_selected)  # OLS model
+summary_pds <- coeftest(model_pds, vcov = vcovCL(model_pds, cluster = final_df$id[complete_cases]))  # Clustered SEs
+
+# Print the results
+print(summary_pds)
+
+# Obtaining control mean
+control_df <- final_df %>%
+  filter(rct == 0)
+
+mean(control_df$ml_w_index, na.rm = T)
+
+# Crosschecking with running the regression on controls mentioned in previous summary
+ml_model_pool <- feols(ml_w_index ~ Treat_C + bl_w_index + bl_marital_status + bl_w_age + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_n_children + bl_sex_label_1 + bl_child_age_months_ | bl_w_loc, data = final_df)
+
+summary(ml_model_pool, cluster = ~id)
+```
+
+
+# Lower Bound
+```{r}
+# Preprocess data: Keep only complete cases
+complete_cases <- complete.cases(trimmed_lower$ml_w_index, trimmed_lower$Treat_C, 
+                                 trimmed_lower$bl_w_index, trimmed_lower$bl_w_loc, trimmed_lower$bl_w_age, trimmed_lower$bl_no_education, trimmed_lower$bl_marital_status, trimmed_lower$bl_primary_completed, trimmed_lower$bl_secondary_completed, trimmed_lower$bl_hh_size, trimmed_lower$bl_n_children, trimmed_lower$bl_sex_label_1, trimmed_lower$bl_child_age_months_)
+
+y <- trimmed_lower$ml_w_index[complete_cases]  # Outcome (midline labor supply)
+d <- trimmed_lower$Treat_C[complete_cases]  # Treatment (Treat_C dummy)
+X <- scale(model.matrix(~ bl_w_index + bl_marital_status + bl_w_age + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_n_children + bl_sex_label_1 + bl_child_age_months_ + bl_w_loc - 1, data = trimmed_lower[complete_cases, ]))  # Covariates
+
+
+# LASSO for outcome (y) and treatment (d)
+lasso_y <- cv.glmnet(X, y, alpha = 1)  # LASSO for outcome
+lasso_d <- cv.glmnet(X, d, alpha = 1, family = "binomial")  # LASSO for treatment
+
+# Combine selected variables
+selected_vars <- union(
+  which(coef(lasso_y, s = "lambda.min")[-1] != 0),
+  which(coef(lasso_d, s = "lambda.min")[-1] != 0)
+)
+
+# Final OLS regression
+X_selected <- if (length(selected_vars) > 0) X[, selected_vars, drop = FALSE] else matrix(nrow = nrow(X), ncol = 0)
+model_pds <- lm(y ~ d + X_selected)  # OLS model
+summary_pds <- coeftest(model_pds, vcov = vcovCL(model_pds, cluster = trimmed_lower$id[complete_cases]))  # Clustered SEs
+
+# Print the results
+print(summary_pds)
+
+# Crosschecking with running the regression on controls mentioned in previous summary
+ml_model_lower <- feols(ml_w_index ~ Treat_C + bl_w_index + bl_marital_status + bl_w_age + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_n_children + bl_sex_label_1 + bl_child_age_months_ | bl_w_loc, data = trimmed_lower)
+
+summary(ml_model_lower, cluster = ~id)
+```
+
+
+# Upper Bound
+```{r}
+# Preprocess data: Keep only complete cases
+complete_cases <- complete.cases(trimmed_upper$ml_w_index, trimmed_upper$Treat_C, 
+                                 trimmed_upper$bl_w_index, trimmed_upper$bl_w_loc, trimmed_upper$bl_w_age, trimmed_upper$bl_no_education, trimmed_upper$bl_marital_status, trimmed_upper$bl_primary_completed, trimmed_upper$bl_secondary_completed, trimmed_upper$bl_hh_size, trimmed_upper$bl_n_children, trimmed_upper$bl_sex_label_1, trimmed_upper$bl_child_age_months_)
+
+y <- trimmed_upper$ml_w_index[complete_cases]  # Outcome (midline labor supply)
+d <- trimmed_upper$Treat_C[complete_cases]  # Treatment (Treat_C dummy)
+X <- scale(model.matrix(~ bl_w_index + bl_marital_status + bl_w_age + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_n_children + bl_sex_label_1 + bl_child_age_months_ + bl_w_loc - 1, data = trimmed_upper[complete_cases, ]))  # Covariates
+
+# LASSO for outcome (y) and treatment (d)
+lasso_y <- cv.glmnet(X, y, alpha = 1)  # LASSO for outcome
+lasso_d <- cv.glmnet(X, d, alpha = 1, family = "binomial")  # LASSO for treatment
+
+# Combine selected variables
+selected_vars <- union(
+  which(coef(lasso_y, s = "lambda.min")[-1] != 0),
+  which(coef(lasso_d, s = "lambda.min")[-1] != 0)
+)
+
+# Final OLS regression
+X_selected <- if (length(selected_vars) > 0) X[, selected_vars, drop = FALSE] else matrix(nrow = nrow(X), ncol = 0)
+model_pds <- lm(y ~ d + X_selected)  # OLS model
+summary_pds <- coeftest(model_pds, vcov = vcovCL(model_pds, cluster = trimmed_upper$id[complete_cases]))  # Clustered SEs
+
+# Print the results
+print(summary_pds)
+
+# Crosschecking with running the regression on controls mentioned in previous summary
+ml_model_upper <- feols(ml_w_index ~ Treat_C + bl_w_index + bl_marital_status + bl_w_age + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_sex_label_1 + bl_child_age_months_ | bl_w_loc, data = trimmed_upper)
+
+summary(ml_model_upper, cluster = ~id)
+```
+
+
+# Endline
+```{r}
+# Preprocess data: Keep only complete cases
+complete_cases <- complete.cases(final_df$el_w_index, final_df$Treat_C, 
+                                 final_df$bl_w_index, final_df$bl_w_loc, final_df$bl_w_age, final_df$bl_no_education, final_df$bl_marital_status, final_df$bl_primary_completed, final_df$bl_secondary_completed, final_df$bl_hh_size, final_df$bl_n_children, final_df$bl_sex_label_1, 
+                                 final_df$bl_child_age_months_)
+y <- final_df$el_w_index[complete_cases]  # Outcome (midline labor supply)
+d <- final_df$Treat_C[complete_cases]  # Treatment (Treat_C dummy)
+X <- scale(model.matrix(~ bl_w_index + bl_marital_status + bl_w_age + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_n_children + bl_sex_label_1 + bl_child_age_months_ + bl_w_loc - 1, data = final_df[complete_cases, ]))  # Covariates
+
+# LASSO for outcome (y) and treatment (d)
+lasso_y <- cv.glmnet(X, y, alpha = 1)  # LASSO for outcome
+lasso_d <- cv.glmnet(X, d, alpha = 1, family = "binomial")  # LASSO for treatment
+
+# Combine selected variables
+selected_vars <- union(
+  which(coef(lasso_y, s = "lambda.min")[-1] != 0),
+  which(coef(lasso_d, s = "lambda.min")[-1] != 0)
+)
+
+# Final OLS regression
+X_selected <- if (length(selected_vars) > 0) X[, selected_vars, drop = FALSE] else matrix(nrow = nrow(X), ncol = 0)
+model_pds <- lm(y ~ d + X_selected)  # OLS model
+summary_pds <- coeftest(model_pds, vcov = vcovCL(model_pds, cluster = final_df$id[complete_cases]))  # Clustered SEs
+
+# Print the results
+print(summary_pds)
+
+# Extracting control mean
+control_df <- final_df %>%
+  filter(rct == 0)
+
+mean(control_df$el_w_index, na.rm = T) # control mean
+
+# Crosschecking with running the regression on controls mentioned in previous summary
+el_model_pool <- feols(el_w_index ~ Treat_C + bl_w_index + bl_marital_status + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_sex_label_1 + bl_child_age_months_ | bl_w_loc, data = final_df)
+
+summary(el_model_pool, cluster ~ id)
+```
+
+
+# Lower Bound
+```{r}
+# Preprocess data: Keep only complete cases
+complete_cases <- complete.cases(trimmed_lower$el_w_index, trimmed_lower$Treat_C, 
+                                 trimmed_lower$bl_w_index, trimmed_lower$bl_w_loc, trimmed_lower$bl_w_age, trimmed_lower$bl_no_education, trimmed_lower$bl_marital_status, trimmed_lower$bl_primary_completed, trimmed_lower$bl_secondary_completed, trimmed_lower$bl_hh_size, trimmed_lower$bl_n_children, trimmed_lower$bl_sex_label_1, trimmed_lower$bl_child_age_months_)
+
+y <- trimmed_lower$el_w_index[complete_cases]  # Outcome (midline labor supply)
+d <- trimmed_lower$Treat_C[complete_cases]  # Treatment (Treat_C dummy)
+X <- scale(model.matrix(~ bl_w_index + bl_marital_status + bl_w_age + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_n_children + bl_sex_label_1 + bl_child_age_months_ + bl_w_loc - 1, data = trimmed_lower[complete_cases, ]))  # Covariates
+
+# LASSO for outcome (y) and treatment (d)
+lasso_y <- cv.glmnet(X, y, alpha = 1)  # LASSO for outcome
+lasso_d <- cv.glmnet(X, d, alpha = 1, family = "binomial")  # LASSO for treatment
+
+# Combine selected variables
+selected_vars <- union(
+  which(coef(lasso_y, s = "lambda.min")[-1] != 0),
+  which(coef(lasso_d, s = "lambda.min")[-1] != 0)
+)
+
+# Final OLS regression
+X_selected <- if (length(selected_vars) > 0) X[, selected_vars, drop = FALSE] else matrix(nrow = nrow(X), ncol = 0)
+model_pds <- lm(y ~ d + X_selected)  # OLS model
+summary_pds <- coeftest(model_pds, vcov = vcovCL(model_pds, cluster = trimmed_lower$id[complete_cases]))  # Clustered SEs
+
+# Print the results
+print(summary_pds)
+
+# Crosschecking with running the regression on controls mentioned in previous summary
+el_model_lower <- feols(el_w_index ~ Treat_C + bl_w_index + bl_marital_status + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_sex_label_1 + bl_child_age_months_ | bl_w_loc, data = trimmed_lower)
+
+summary(el_model_lower, cluster ~ id)
+```
+
+
+# Upper Bound
+```{r}
+# Preprocess data: Keep only complete cases
+complete_cases <- complete.cases(trimmed_upper$el_w_index, trimmed_upper$Treat_C, 
+                                 trimmed_upper$bl_w_index, trimmed_upper$bl_w_loc, trimmed_upper$bl_w_age, trimmed_upper$bl_no_education, trimmed_upper$bl_marital_status, trimmed_upper$bl_primary_completed, trimmed_upper$bl_secondary_completed, trimmed_upper$bl_hh_size, trimmed_upper$bl_n_children, trimmed_upper$bl_sex_label_1, trimmed_upper$bl_child_age_months_)
+
+y <- trimmed_upper$el_w_index[complete_cases]  # Outcome (midline labor supply)
+d <- trimmed_upper$Treat_C[complete_cases]  # Treatment (Treat_C dummy)
+X <- scale(model.matrix(~ bl_w_index + bl_marital_status + bl_w_age + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_n_children + bl_sex_label_1 + bl_child_age_months_ + bl_w_loc - 1, data = trimmed_upper[complete_cases, ]))  # Covariates
+
+# LASSO for outcome (y) and treatment (d)
+lasso_y <- cv.glmnet(X, y, alpha = 1)  # LASSO for outcome
+lasso_d <- cv.glmnet(X, d, alpha = 1, family = "binomial")  # LASSO for treatment
+
+# Combine selected variables
+selected_vars <- union(
+  which(coef(lasso_y, s = "lambda.min")[-1] != 0),
+  which(coef(lasso_d, s = "lambda.min")[-1] != 0)
+)
+
+# Final OLS regression
+X_selected <- if (length(selected_vars) > 0) X[, selected_vars, drop = FALSE] else matrix(nrow = nrow(X), ncol = 0)
+model_pds <- lm(y ~ d + X_selected)  # OLS model
+summary_pds <- coeftest(model_pds, vcov = vcovCL(model_pds, cluster = trimmed_upper$id[complete_cases]))  # Clustered SEs
+
+# Print the results
+print(summary_pds)
+
+# Crosschecking with running the regression on controls mentioned in previous summary
+el_model_upper <- feols(el_w_index ~ Treat_C + bl_w_index + bl_marital_status + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_sex_label_1 + bl_child_age_months_ | bl_w_loc, data = trimmed_upper)
+
+summary(el_model_upper, cluster ~ id)
+```
+
+
+# Panel Data - to make sure the findings align 
+```{r}
+final_long <- final_df %>%
+  pivot_longer(
+    cols = c(bl_w_index, ml_w_index, el_w_index), 
+    names_to = "time",                           
+    values_to = "w_index"                       
+  ) %>%
+  mutate(
+    midline = ifelse(time == "ml_w_index", 1, 0),
+    endline = ifelse(time == "el_w_index", 1, 0),
+    Any_T = ifelse(Treat_C ==1 & time == "bl_w_index", 0, Treat_C)
+  )
+
+panel <- pdata.frame(final_long, index = c("id", "time"))
+
+# Preprocessing panel data: Ensure there are no missing values
+panel_clean <- panel[complete.cases(panel$w_index, panel$Any_T, panel$midline, panel$endline, panel$id), ]
+
+# Outcome (w_index) and Treatment (Any_T)
+y <- panel_clean$w_index
+d <- panel_clean$Any_T
+
+# Covariates (explanatory variables like midline, endline, etc.)
+X <- scale(model.matrix(~ midline + endline + bl_marital_status + bl_w_age + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_n_children + bl_sex_label_1 + bl_child_age_months_ + id - 1, data = panel_clean))  # Covariates matrix
+
+# LASSO for outcome (y) and treatment (d)
+lasso_y <- cv.glmnet(X, y, alpha = 1)  # LASSO for outcome variable
+lasso_d <- cv.glmnet(X, d, alpha = 1, family = "binomial")  # LASSO for treatment variable
+
+# Identify selected variables using LASSO
+selected_vars <- union(
+  which(coef(lasso_y, s = "lambda.min")[-1] != 0), 
+  which(coef(lasso_d, s = "lambda.min")[-1] != 0)
+)
+
+# Subset the X matrix based on selected variables
+X_selected <- if (length(selected_vars) > 0) X[, selected_vars, drop = FALSE] else matrix(nrow = nrow(X), ncol = 0)
+
+# Fixed effects model with the selected variables
+model_pds <- plm(
+  y ~ d + X_selected + midline + endline + Any_T:endline,
+  data = panel_clean,
+  model = "within",
+  index = "id" # Within transformation for fixed effects
+)
+
+# Clustered standard errors by individual (id)
+clustered_se_pds <- vcovHC(model_pds, method = "arellano", cluster = "group")
+
+# Summary of the results with robust standard errors
+summary_pds <- coeftest(model_pds, vcov = clustered_se_pds)
+print(summary_pds)
+
+# Crosschecking with running the regression on controls mentioned in previous summary
+panel_model <- feols(w_index ~ Any_T + midline + endline + Any_T:endline | id, data = panel_clean)
+
+summary(panel_model, cluster ~ id)
+
+# Running blanks to make sure ID FE is causing discrepency
+el_model_pool_blank <- feols(el_w_index ~ Treat_C | bl_w_loc, data = final_df)
+
+summary(el_model_pool_blank) # Coefficient for Endline ANCOVA
+
+model_blank <- lm(w_index ~ Any_T + midline + endline + Any_T:endline, data = panel_clean)
+summary(model_blank)# Coefficient for Endline ANCOVA = AnyT + Interaction
+
+panel_model_blank <- feols(w_index ~ Any_T + midline + endline + Any_T:endline | id, data = panel_clean)
+
+summary(panel_model_blank) # Coefficient for Endline ANCOVA NOT EQUAL AnyT + Interaction
+```
+
+
+# Final Regressions without baseline controls - additional validation
+```{r}
+# Midline FE Regressions
+ml_model_pool <- feols(ml_w_index ~ Treat_C + bl_w_index | bl_w_loc, data = final_df)
+
+summary(ml_model_pool, cluster = ~id)
+
+# Lower Bound of Midline FE Regressions
+ml_model_lower <- feols(ml_w_index ~ Treat_C + bl_w_index | bl_w_loc, data = trimmed_lower)
+
+summary(ml_model_lower, cluster = ~id)
+
+# Upper Bound of Midline FE Regressions
+ml_model_upper <- feols(ml_w_index ~ Treat_C + bl_w_index | bl_w_loc, data = trimmed_upper)
+
+summary(ml_model_upper, cluster = ~id)
+
+# Endline FE Regressions
+el_model_pool <- feols(el_w_index ~ Treat_C + bl_w_index | bl_w_loc, data = final_df)
+
+summary(el_model_pool, cluster = ~id)
+
+# Lower Bound of Endline FE Regressions
+el_model_lower <- feols(el_w_index ~ Treat_C + bl_w_index | bl_w_loc, data = trimmed_lower)
+
+summary(el_model_lower, cluster = ~id)
+
+# Upper Bound of Endline FE Regressions
+el_model_upper <- feols(el_w_index ~ Treat_C + bl_w_index | bl_w_loc, data = trimmed_upper)
+
+summary(el_model_upper, cluster = ~id)
+
+# Panel Model - same as earlier
+panel_model <- feols(w_index ~ Any_T + midline + endline + Any_T:endline | id, data = panel_clean)
+
+summary(panel_model, cluster ~ id)
+```
+
+
+# Regressions: Separated Specification
+### Midline Replication with Fixed Effects 
+```{r}
+# Define controls
+controls <- c("bl_w_age", "bl_no_education", "bl_marital_status", 
+              "bl_primary_completed", "bl_secondary_completed", 
+              "bl_hh_size", "bl_n_children", "bl_sex_label_1", "bl_child_age_months_")
+
+# Define formula
+formula_2_s <- as.formula(
+  paste("ml_w_index ~ Treat_1 + Treat_2 + bl_w_index + ", 
+        paste(controls, collapse = " + "), "| bl_w_loc")
+)
+
+# Fit model
+model_2_s <- feols(formula_2_s, data = final_df)
+
+# Compute clustered standard errors
+summary(model_2_s, cluster ~ id)
+
+# Obtaining control mean
+control_df <- final_df %>%
+  filter(rct == 0)
+
+mean(control_df$ml_w_index, na.rm = TRUE)
+```
+
+
+## LASSO Attempt and Midline Regressions - Not Used in Table
+### With FE
+```{r}
+# Preprocess data: Keep only complete cases
+complete_cases <- complete.cases(final_df$ml_w_index, final_df$Treat_1 , final_df$Treat_2, 
+                                 final_df$bl_w_index, final_df$bl_w_loc, final_df$bl_w_age, final_df$bl_no_education, final_df$bl_marital_status, final_df$bl_primary_completed, final_df$bl_secondary_completed, final_df$bl_hh_size, final_df$bl_n_children, final_df$bl_sex_label_1, 
+                                 final_df$bl_child_age_months_)
+
+y <- final_df$ml_w_index[complete_cases]  # Outcome (midline labor supply)
+d_Treat_1 <- final_df$Treat_1[complete_cases]  # Treatment (Treat_1 dummy)
+d_Treat_2 <- final_df$Treat_2[complete_cases]  # Treatment (Treat_2 dummy)
+X <- scale(model.matrix(~ bl_w_index + bl_marital_status + bl_w_age + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_n_children + bl_sex_label_1 + bl_child_age_months_ + bl_w_loc - 1, data = final_df[complete_cases, ]))  # Covariates
+
+# LASSO for outcome (y) and treatment (d)
+lasso_y <- cv.glmnet(X, y, alpha = 1)  # LASSO for outcome
+lasso_d_Treat_1 <- cv.glmnet(X, d_Treat_1, alpha = 1, family = "binomial")  # LASSO for Treat_1 treatment
+lasso_d_Treat_2 <- cv.glmnet(X, d_Treat_2, alpha = 1, family = "binomial")  # LASSO for Treat_2 treatment
+
+# Union of selected variables
+selected_vars <- union(
+  which(coef(lasso_y, s = "lambda.min")[-1] != 0), 
+  union(
+    which(coef(lasso_d_Treat_1, s = "lambda.min")[-1] != 0),
+    which(coef(lasso_d_Treat_2, s = "lambda.min")[-1] != 0)
+  )
+)
+
+# Final OLS regression
+X_selected <- if (length(selected_vars) > 0) X[, selected_vars, drop = FALSE] else matrix(nrow = nrow(X), ncol = 0)
+model_pds <- lm(y ~ d_Treat_1 + d_Treat_2 + X_selected)  # OLS model
+summary_pds <- coeftest(model_pds, vcov = vcovCL(model_pds, cluster = final_df$id[complete_cases]))  # Clustered SEs
+
+# Print the results
+print(summary_pds)
+
+# Crosschecking with running the regression on controls mentioned in previous summary
+ml_model <- feols(ml_w_index ~ Treat_1 + Treat_2 + bl_w_index + bl_marital_status + bl_w_age + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_n_children +  bl_sex_label_1 + bl_child_age_months_ | bl_w_loc, data = final_df)
+
+summary(ml_model, cluster ~ id)
+```
+
+
+# Lower Bound
+```{r}
+# Preprocess data: Keep only complete cases
+complete_cases <- complete.cases(trimmed_df_lower_sep$ml_w_index, trimmed_df_lower_sep$Treat_1 , trimmed_df_lower_sep$Treat_2, trimmed_df_lower_sep$bl_w_index, trimmed_df_lower_sep$bl_w_loc, trimmed_df_lower_sep$bl_w_age, trimmed_df_lower_sep$bl_no_education, trimmed_df_lower_sep$bl_marital_status, trimmed_df_lower_sep$bl_primary_completed, trimmed_df_lower_sep$bl_secondary_completed, trimmed_df_lower_sep$bl_hh_size, trimmed_df_lower_sep$bl_n_children, trimmed_df_lower_sep$bl_sex_label_1, 
+                                 trimmed_df_lower_sep$bl_child_age_months_)
+
+y <- trimmed_df_lower_sep$ml_w_index[complete_cases]  # Outcome (midline labor supply)
+d_Treat_1 <- trimmed_df_lower_sep$Treat_1[complete_cases]  # Treatment (Treat_1 dummy)
+d_Treat_2 <- trimmed_df_lower_sep$Treat_2[complete_cases]  # Treatment (Treat_1 dummy)
+X <- scale(model.matrix(~ bl_w_index + bl_marital_status + bl_w_age + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_n_children + bl_sex_label_1 + bl_child_age_months_ + bl_w_loc - 1, data = trimmed_df_lower_sep[complete_cases, ]))  # Covariates
+
+# LASSO for outcome (y) and treatment (d)
+lasso_y <- cv.glmnet(X, y, alpha = 1)  # LASSO for outcome
+lasso_d_Treat_1 <- cv.glmnet(X, d_Treat_1, alpha = 1, family = "binomial")  # LASSO for Treat_1 treatment
+lasso_d_Treat_2 <- cv.glmnet(X, d_Treat_2, alpha = 1, family = "binomial")  # LASSO for Treat_2 treatment
+
+# Union of selected variables
+selected_vars <- union(
+  which(coef(lasso_y, s = "lambda.min")[-1] != 0), 
+  union(
+    which(coef(lasso_d_Treat_1, s = "lambda.min")[-1] != 0),
+    which(coef(lasso_d_Treat_2, s = "lambda.min")[-1] != 0)
+  )
+)
+
+# Final OLS regression
+X_selected <- if (length(selected_vars) > 0) X[, selected_vars, drop = FALSE] else matrix(nrow = nrow(X), ncol = 0)
+model_pds <- lm(y ~ d_Treat_1 + d_Treat_2 + X_selected)  # OLS model
+summary_pds <- coeftest(model_pds, vcov = vcovCL(model_pds, cluster = trimmed_df_lower_sep$id[complete_cases]))  # Clustered SEs
+
+# Print the results
+print(summary_pds)
+
+# Crosschecking with running the regression on controls mentioned in previous summary
+ml_model_lower <- feols(ml_w_index ~ Treat_1 + Treat_2 + bl_w_index + bl_marital_status + bl_w_age + bl_no_education + bl_secondary_completed + bl_sex_label_1 | bl_w_loc, data = trimmed_df_lower_sep)
+
+summary(ml_model_lower, cluster ~ id)
+```
+
+
+# Upper Bound
+```{r}
+# Preprocess data: Keep only complete cases
+complete_cases <- complete.cases(trimmed_df_upper_sep$ml_w_index, trimmed_df_upper_sep$Treat_1 , trimmed_df_upper_sep$Treat_2, trimmed_df_upper_sep$bl_w_index, trimmed_df_upper_sep$bl_w_loc, trimmed_df_upper_sep$bl_w_age, trimmed_df_upper_sep$bl_no_education, trimmed_df_upper_sep$bl_marital_status, trimmed_df_upper_sep$bl_primary_completed, trimmed_df_upper_sep$bl_secondary_completed, trimmed_df_upper_sep$bl_hh_size, trimmed_df_upper_sep$bl_n_children, trimmed_df_upper_sep$bl_sex_label_1, 
+                                 trimmed_df_upper_sep$bl_child_age_months_)
+
+y <- trimmed_df_upper_sep$ml_w_index[complete_cases]  # Outcome (midline labor supply)
+d_Treat_1 <- trimmed_df_upper_sep$Treat_1[complete_cases]  # Treatment (Treat_1 dummy)
+d_Treat_2 <- trimmed_df_upper_sep$Treat_2[complete_cases]  # Treatment (Treat_2 dummy)
+X <- scale(model.matrix(~ bl_w_index + bl_marital_status + bl_w_age + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_n_children + bl_sex_label_1 + bl_child_age_months_ + bl_w_loc - 1, data = trimmed_df_upper_sep[complete_cases, ]))  # Covariates
+
+# LASSO for outcome (y) and treatment (d)
+lasso_y <- cv.glmnet(X, y, alpha = 1)  # LASSO for outcome
+lasso_d_Treat_1 <- cv.glmnet(X, d_Treat_1, alpha = 1, family = "binomial")  # LASSO for Treat_1 treatment
+lasso_d_Treat_2 <- cv.glmnet(X, d_Treat_2, alpha = 1, family = "binomial")  # LASSO for Treat_2 treatment
+
+# Union of selected variables
+selected_vars <- union(
+  which(coef(lasso_y, s = "lambda.min")[-1] != 0), 
+  union(
+    which(coef(lasso_d_Treat_1, s = "lambda.min")[-1] != 0),
+    which(coef(lasso_d_Treat_2, s = "lambda.min")[-1] != 0)
+  )
+)
+
+# Final OLS regression
+X_selected <- if (length(selected_vars) > 0) X[, selected_vars, drop = FALSE] else matrix(nrow = nrow(X), ncol = 0)
+model_pds <- lm(y ~ d_Treat_1 + d_Treat_2 + X_selected)  # OLS model
+summary_pds <- coeftest(model_pds, vcov = vcovCL(model_pds, cluster = trimmed_df_upper_sep$id[complete_cases]))  # Clustered SEs
+
+# Print the results
+print(summary_pds)
+
+# Crosschecking with running the regression on controls mentioned in previous summary
+ml_model_upper <- feols(ml_w_index ~ Treat_1 + Treat_2 + bl_w_index + bl_marital_status + bl_w_age + bl_no_education + bl_primary_completed + bl_secondary_completed +  bl_sex_label_1 + bl_child_age_months_ | bl_w_loc, data = trimmed_df_upper_sep)
+
+summary(ml_model_upper, cluster ~ id)
+```
+
+
+# Endline
+```{r}
+# Preprocess data: Keep only complete cases
+complete_cases <- complete.cases(final_df$el_w_index, final_df$Treat_1 , final_df$Treat_2, 
+                                 final_df$bl_w_index, final_df$bl_w_loc, final_df$bl_w_age, final_df$bl_no_education, final_df$bl_marital_status, final_df$bl_primary_completed, final_df$bl_secondary_completed, final_df$bl_hh_size, final_df$bl_n_children, final_df$bl_sex_label_1, 
+                                 final_df$bl_child_age_months_)
+
+y <- final_df$el_w_index[complete_cases]  # Outcome (midline labor supply)
+d_Treat_1 <- final_df$Treat_1[complete_cases]  # Treatment (Treat_1 dummy)
+d_Treat_2 <- final_df$Treat_2[complete_cases]  # Treatment (Treat_2 dummy)
+X <- scale(model.matrix(~ bl_w_index + bl_marital_status + bl_w_age + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_n_children + bl_sex_label_1 + bl_child_age_months_ + bl_w_loc - 1, data = final_df[complete_cases, ]))  # Covariates
+
+# LASSO for outcome (y) and treatment (d)
+lasso_y <- cv.glmnet(X, y, alpha = 1)  # LASSO for outcome
+lasso_d_Treat_1 <- cv.glmnet(X, d_Treat_1, alpha = 1, family = "binomial")  # LASSO for Treat_1 treatment
+lasso_d_Treat_2 <- cv.glmnet(X, d_Treat_2, alpha = 1, family = "binomial")  # LASSO for Treat_2 treatment
+
+# Union of selected variables
+selected_vars <- union(
+  which(coef(lasso_y, s = "lambda.min")[-1] != 0), 
+  union(
+    which(coef(lasso_d_Treat_1, s = "lambda.min")[-1] != 0),
+    which(coef(lasso_d_Treat_2, s = "lambda.min")[-1] != 0)
+  )
+)
+
+# Final OLS regression
+X_selected <- if (length(selected_vars) > 0) X[, selected_vars, drop = FALSE] else matrix(nrow = nrow(X), ncol = 0)
+model_pds <- lm(y ~ d_Treat_1 + d_Treat_2 + X_selected)  # OLS model
+summary_pds <- coeftest(model_pds, vcov = vcovCL(model_pds, cluster = final_df$id[complete_cases]))  # Clustered SEs
+
+# Print the results
+print(summary_pds)
+
+# Crosschecking with running the regression on controls mentioned in previous summary
+el_model <- feols(el_w_index ~ Treat_1 + Treat_2 + bl_w_index + bl_marital_status + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_sex_label_1 + bl_child_age_months_ | bl_w_loc, data = final_df)
+
+summary(el_model, cluster ~ id)
+```
+
+
+# Lower Bound
+```{r}
+# Preprocess data: Keep only complete cases
+complete_cases <- complete.cases(trimmed_df_lower_sep$el_w_index, trimmed_df_lower_sep$Treat_1 , trimmed_df_lower_sep$Treat_2, trimmed_df_lower_sep$bl_w_index, trimmed_df_lower_sep$bl_w_loc, trimmed_df_lower_sep$bl_w_age, trimmed_df_lower_sep$bl_no_education, trimmed_df_lower_sep$bl_marital_status, trimmed_df_lower_sep$bl_primary_completed, trimmed_df_lower_sep$bl_secondary_completed, trimmed_df_lower_sep$bl_hh_size, trimmed_df_lower_sep$bl_n_children, trimmed_df_lower_sep$bl_sex_label_1, 
+                                 trimmed_df_lower_sep$bl_child_age_months_)
+
+y <- trimmed_df_lower_sep$el_w_index[complete_cases]  # Outcome (midline labor supply)
+d_Treat_1 <- trimmed_df_lower_sep$Treat_1[complete_cases]  # Treatment (Treat_1 dummy)
+d_Treat_2 <- trimmed_df_lower_sep$Treat_2[complete_cases]  # Treatment (Treat_2 dummy)
+X <- scale(model.matrix(~ bl_w_index + bl_marital_status + bl_w_age + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_n_children + bl_sex_label_1 + bl_child_age_months_ + bl_w_loc - 1, data = trimmed_df_lower_sep[complete_cases, ]))  # Covariates
+
+# LASSO for outcome (y) and treatment (d)
+lasso_y <- cv.glmnet(X, y, alpha = 1)  # LASSO for outcome
+lasso_d_Treat_1 <- cv.glmnet(X, d_Treat_1, alpha = 1, family = "binomial")  # LASSO for Treat_1 treatment
+lasso_d_Treat_2 <- cv.glmnet(X, d_Treat_2, alpha = 1, family = "binomial")  # LASSO for Treat_2 treatment
+
+# Union of selected variables
+selected_vars <- union(
+  which(coef(lasso_y, s = "lambda.min")[-1] != 0), 
+  union(
+    which(coef(lasso_d_Treat_1, s = "lambda.min")[-1] != 0),
+    which(coef(lasso_d_Treat_2, s = "lambda.min")[-1] != 0)
+  )
+)
+
+# Final OLS regression
+X_selected <- if (length(selected_vars) > 0) X[, selected_vars, drop = FALSE] else matrix(nrow = nrow(X), ncol = 0)
+model_pds <- lm(y ~ d_Treat_1 + d_Treat_2 + X_selected)  # OLS model
+summary_pds <- coeftest(model_pds, vcov = vcovCL(model_pds, cluster = trimmed_df_lower_sep$id[complete_cases]))  # Clustered SEs
+
+# Print the results
+print(summary_pds)
+
+# Crosschecking with running the regression on controls mentioned in previous summary
+el_model_lower <- feols(el_w_index ~ Treat_1 + Treat_2 + bl_w_index + bl_marital_status + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_sex_label_1 + bl_child_age_months_ | bl_w_loc, data = trimmed_df_lower_sep)
+
+summary(el_model_lower, cluster ~ id)
+```
+
+
+# Upper Bound
+```{r}
+# Preprocess data: Keep only complete cases
+complete_cases <- complete.cases(trimmed_df_upper_sep$el_w_index, trimmed_df_upper_sep$Treat_1 , trimmed_df_upper_sep$Treat_2, trimmed_df_upper_sep$bl_w_index, trimmed_df_upper_sep$bl_w_loc, trimmed_df_upper_sep$bl_w_age, trimmed_df_upper_sep$bl_no_education, trimmed_df_upper_sep$bl_marital_status, trimmed_df_upper_sep$bl_primary_completed, trimmed_df_upper_sep$bl_secondary_completed, trimmed_df_upper_sep$bl_hh_size, trimmed_df_upper_sep$bl_n_children, trimmed_df_upper_sep$bl_sex_label_1, 
+                                 trimmed_df_upper_sep$bl_child_age_months_)
+
+y <- trimmed_df_upper_sep$el_w_index[complete_cases]  # Outcome (midline labor supply)
+d_Treat_1 <- trimmed_df_upper_sep$Treat_1[complete_cases]  # Treatment (Treat_1 dummy)
+d_Treat_2 <- trimmed_df_upper_sep$Treat_2[complete_cases]  # Treatment (Treat_2 dummy)
+X <- scale(model.matrix(~ bl_w_index + bl_marital_status + bl_w_age + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_n_children + bl_sex_label_1 + bl_child_age_months_ + bl_w_loc - 1, data = trimmed_df_upper_sep[complete_cases, ]))  # Covariates
+
+# LASSO for outcome (y) and treatment (d)
+lasso_y <- cv.glmnet(X, y, alpha = 1)  # LASSO for outcome
+lasso_d_Treat_1 <- cv.glmnet(X, d_Treat_1, alpha = 1, family = "binomial")  # LASSO for Treat_1 treatment
+lasso_d_Treat_2 <- cv.glmnet(X, d_Treat_2, alpha = 1, family = "binomial")  # LASSO for Treat_2 treatment
+
+# Union of selected variables
+selected_vars <- union(
+  which(coef(lasso_y, s = "lambda.min")[-1] != 0), 
+  union(
+    which(coef(lasso_d_Treat_1, s = "lambda.min")[-1] != 0),
+    which(coef(lasso_d_Treat_2, s = "lambda.min")[-1] != 0)
+  )
+)
+
+# Final OLS regression
+X_selected <- if (length(selected_vars) > 0) X[, selected_vars, drop = FALSE] else matrix(nrow = nrow(X), ncol = 0)
+model_pds <- lm(y ~ d_Treat_1 + d_Treat_2 + X_selected)  # OLS model
+summary_pds <- coeftest(model_pds, vcov = vcovCL(model_pds, cluster = trimmed_df_upper_sep$id[complete_cases]))  # Clustered SEs
+
+# Print the results
+print(summary_pds)
+
+# Crosschecking with running the regression on controls mentioned in previous summary
+el_model_upper <- feols(el_w_index ~ Treat_1 + Treat_2 + bl_w_index + bl_marital_status + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_sex_label_1 + bl_child_age_months_ | bl_w_loc, data = trimmed_df_upper_sep)
+
+summary(el_model_upper, cluster ~ id)
+```
+
+
+# Panel Data - to make sure the findings align 
+```{r}
+final_long <- final_df %>%
+  pivot_longer(
+    cols = c(bl_w_index, ml_w_index, el_w_index), 
+    names_to = "time",                           
+    values_to = "w_index"                       
+  ) %>%
+  mutate(
+    midline = ifelse(time == "ml_w_index", 1, 0),
+    endline = ifelse(time == "el_w_index", 1, 0),
+    AnyTreat_1 = ifelse(Treat_1 ==1 & time == "bl_w_index", 0, Treat_1),
+    AnyTreat_2 = ifelse(Treat_2 ==1 & time == "bl_w_index", 0, Treat_2)
+  )
+
+panel <- pdata.frame(final_long, index = c("id", "time"))
+
+# Preprocessing panel data: Ensure there are no missing values
+panel_clean <- panel[complete.cases(panel$w_index, panel$AnyTreat_1, panel$AnyTreat_2, panel$midline, panel$endline, panel$id), ]
+
+# Outcome (w_index) and Treatment (AnyTreat_1 and AnyTreat_2)
+y <- panel_clean$w_index
+d_Treat_1 <- panel_clean$AnyTreat_1
+d_Treat_2 <- panel_clean$AnyTreat_2
+
+# Covariates (explanatory variables like midline, endline, etc.)
+X <- scale(model.matrix(~ midline + endline + bl_marital_status + bl_w_age + bl_no_education + bl_primary_completed + bl_secondary_completed + bl_hh_size + bl_n_children + bl_sex_label_1 + bl_child_age_months_ + id - 1, data = panel_clean))  # Covariates matrix
+
+# LASSO for outcome (y) and treatment (d)
+lasso_y <- cv.glmnet(X, y, alpha = 1)  # LASSO for outcome variable
+lasso_d_Treat_1 <- cv.glmnet(X, d_Treat_1, alpha = 1, family = "binomial")  # LASSO for Treat_1 treatment
+lasso_d_Treat_2 <- cv.glmnet(X, d_Treat_2, alpha = 1, family = "binomial")  # LASSO for Treat_2 treatment
+
+# Union of selected variables
+selected_vars <- union(
+  which(coef(lasso_y, s = "lambda.min")[-1] != 0), 
+  union(
+    which(coef(lasso_d_Treat_1, s = "lambda.min")[-1] != 0),
+    which(coef(lasso_d_Treat_2, s = "lambda.min")[-1] != 0)
+  )
+)
+
+# Subset the X matrix based on selected variables
+X_selected <- if (length(selected_vars) > 0) X[, selected_vars, drop = FALSE] else matrix(nrow = nrow(X), ncol = 0)
+
+# Fixed effects model with the selected variables
+model_pds <- plm(
+  y ~ d_Treat_1 + d_Treat_2 + X_selected + midline + endline + AnyTreat_1:endline + AnyTreat_2:endline,
+  data = panel_clean,
+  model = "within",
+  index = "id" # Within transformation for fixed effects
+)
+
+# Clustered standard errors by individual (id)
+clustered_se_pds <- vcovHC(model_pds, method = "arellano", cluster = "group")
+
+# Summary of the results with robust standard errors
+summary_pds <- coeftest(model_pds, vcov = clustered_se_pds)
+print(summary_pds)
+
+# Crosschecking with running the regression on controls mentioned in previous summary
+panel_model_sep <- feols(w_index ~ AnyTreat_1 + AnyTreat_2 + midline + endline + AnyTreat_1:endline + AnyTreat_2:endline | id, data = panel_clean)
+summary(panel_model_sep, cluster ~ id)
+
+# Running blanks to make sure ID FE is causing discrepency
+el_model_sep_blank <- feols(el_w_index ~ Treat_1 + Treat_2 | bl_w_loc, data = final_df)
+
+summary(el_model_sep_blank) # Coefficient for Endline ANCOVA Treat_1 and Treat_2
+
+model_blank <- lm(w_index ~ AnyTreat_1 + AnyTreat_2 + midline + endline + AnyTreat_1:endline + AnyTreat_2:endline, data = panel_clean)
+summary(model_blank)# Coefficient for Endline ANCOVA Treat_1 = AnyM + Interaction, Coefficient for Endline ANCOVA Treat_2 = AnyC + Interaction
+
+panel_model_blank <- feols(w_index ~ AnyTreat_1 + AnyTreat_2 + midline + endline + AnyTreat_1:endline + AnyTreat_2:endline | id, data = panel_clean)
+
+summary(panel_model_blank) # Coefficient for Endline ANCOVA Treat_2 NOT EQUAL AnyC + Interaction
+```
+
+
+# Final Regressions without baseline controls - additional validation
+```{r}
+# Midline FE Regressions
+ml_model_sep <- feols(ml_w_index ~ Treat_1 + Treat_2 + bl_w_index | bl_w_loc, data = final_df)
+
+summary(ml_model_sep, cluster = ~id)
+
+# Lower Bound of Midline FE Regressions
+ml_model_lower <- feols(ml_w_index ~  Treat_1 + Treat_2 + bl_w_index | bl_w_loc, data = trimmed_df_lower_sep)
+
+summary(ml_model_lower, cluster = ~id)
+
+# Upper Bound of Midline FE Regressions
+ml_model_upper <- feols(ml_w_index ~  Treat_1 + Treat_2 + bl_w_index | bl_w_loc, data = trimmed_df_upper_sep)
+
+summary(ml_model_upper, cluster = ~id)
+
+# Endline FE Regressions
+el_model_sep <- feols(el_w_index ~  Treat_1 + Treat_2 + bl_w_index | bl_w_loc, data = final_df)
+
+summary(el_model_sep, cluster = ~id)
+
+# Lower Bound of Endline FE Regressions
+el_model_lower <- feols(el_w_index ~ Treat_1 + Treat_2 + bl_w_index | bl_w_loc, data = trimmed_df_lower_sep)
+
+summary(el_model_lower, cluster = ~id)
+
+# Upper Bound of Endline FE Regressions
+el_model_upper <- feols(el_w_index ~ Treat_1 + Treat_2 + bl_w_index | bl_w_loc, data = trimmed_df_upper_sep)
+
+summary(el_model_upper, cluster = ~id)
+
+# Panel Model - same as earlier
+panel_model_sep <- feols(w_index ~ AnyTreat_1 + AnyTreat_2 + midline + endline + AnyTreat_1:endline + AnyTreat_2:endline | id, data = panel_clean)
+
+summary(panel_model_sep, cluster ~ id)
+```
+

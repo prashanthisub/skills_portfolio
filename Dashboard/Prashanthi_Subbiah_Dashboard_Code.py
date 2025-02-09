@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import shiny.ui as ui
 
 # Load the GeoJSON file using GeoPandas
-file_path = "C:/Users/prash/Downloads/Boundaries - Neighborhoods.geojson"
+file_path = "Boundaries - Neighborhoods.geojson"
 chicago_geojson = gpd.read_file(file_path)
 
 # Ensure using the same coordinate system
@@ -19,7 +19,7 @@ chicago_geojson = chicago_geojson.to_crs(epsg=4326)
 # Convert GeoDataFrame to JSON format suitable for Altair
 chicago_geojson_json = json.loads(chicago_geojson.to_json())
 
-waze_data = pd.read_csv("C:/Users/prash/Downloads/waze_data/waze_data.csv")
+waze_data = pd.read_csv("waze_data.csv")
 
 def identify_updated_subtype(subtype):
     if pd.isna(subtype):

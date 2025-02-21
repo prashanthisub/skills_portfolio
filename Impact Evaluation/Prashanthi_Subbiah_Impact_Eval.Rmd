@@ -11,6 +11,7 @@ options(scipen = 100, digits = 4)
 
 # Coding
 ## Packages
+### Important Note: Data from the client is proprietary
 
 ```{r loading-packages, warning = FALSE, message = FALSE}
 # Clear working space

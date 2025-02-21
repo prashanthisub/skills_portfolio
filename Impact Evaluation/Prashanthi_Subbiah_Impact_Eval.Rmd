@@ -581,7 +581,7 @@ sum(is.na(end_df_1$pca_ext)) #no NAs
 
 # Creating other variables
 ```{r}
-# Creating ladder_diff
+# Creating ladder_change
 end_df_1 <- end_df_1 %>%
   mutate(ladder_change = ladder_later - ladder_present)
 
@@ -596,7 +596,7 @@ end_df_3 <- end_df_1 %>%
 
 # Compute the composite index
 end_df_3 <- end_df_3 %>%
-  mutate(w_index = tot_phq_4 + dep_f + anx_f + pca_locus + pca_internal + pca_external + ladder_now + ladder_five + ladder_diff)
+  mutate(w_index = tot_phq_4 + dep_f + anx_f + pca_locus + pca_internal + pca_external + ladder_now + ladder_five + ladder_change)
 
 # Calculate the mean and standard deviation
 control_value_df <- end_df_3 %>%
@@ -620,11 +620,11 @@ sum(is.na(end_df_3$w_index))
 ```{r}
 # Selecting needed columns
 end_df_updated <- end_df_3 %>%
-  select(id, tot_phq_4, dep_f, anx_f, pca_locus, pca_internal, pca_external, ladder_now, ladder_five, ladder_diff, control, w_index)
+  select(id, tot_phq_4, dep_f, anx_f, pca_locus, pca_internal, pca_external, ladder_now, ladder_five, ladder_change, control, w_index)
 
 # Renaming to make merger easier
 colnames(end_df_updated)
-colnames(end_df_updated) <- c("id", "el_tot_phq_4", "el_dep_f", "el_anx_f", "el_pca_locus",  "el_pca_internal", "el_pca_external", "el_ladder_now", "el_ladder_five", "el_ladder_diff", "el_control", "el_w_index")
+colnames(end_df_updated) <- c("id", "el_tot_phq_4", "el_dep_f", "el_anx_f", "el_pca_locus",  "el_pca_internal", "el_pca_external", "el_ladder_now", "el_ladder_five", "el_ladder_change", "el_control", "el_w_index")
 colnames(end_df_updated)
 
 # Export to CSV

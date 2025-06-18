@@ -648,7 +648,7 @@ sum(is.na(end_df_1$pca_ext)) #no NAs
 ```{r}
 # Creating ladder_diff
 end_df_1 <- end_df_1 %>%
-  mutate(ladder_change = ladder_later - ladder_present)
+  mutate(ladder_diff = ladder_five - ladder_now)
 
 # Creating control to indicate treatment status
 end_df_1 <- end_df_1 %>%
@@ -657,8 +657,8 @@ end_df_1 <- end_df_1 %>%
                              treat == 2 ~ 0))
 
 end_df_3 <- end_df_1 %>%
-  select(id, tot_phq_4, dep_f, anx_f, pca_loc, pca_int, pca_ext, ladder_present,
-         ladder_later, ladder_change, control)
+  select(id, tot_phq_4, dep_f, anx_f, pca_loc, pca_int, pca_ext, ladder_now,
+         ladder_five, ladder_diff, control)
 
 # Compute the composite index
 end_df_3 <- end_df_3 %>%
